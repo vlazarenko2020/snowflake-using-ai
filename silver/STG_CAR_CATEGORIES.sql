@@ -1,0 +1,14 @@
+-- Silver: one row per car category, typed and trimmed.
+-- Source: AVELTO_RENTALS.BRONZE.BRONZE_CAR_CATEGORIES
+CREATE SCHEMA IF NOT EXISTS AVELTO_RENTALS.SILVER;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.SILVER.STG_CAR_CATEGORIES
+  TARGET_LAG = '1 minute'
+  WAREHOUSE  = COMPUTE_WH
+  REFRESH_MODE = AUTO
+AS
+SELECT
+    TRY_TO_NUMBER(TRIM(id))                  AS category_id,
+    TRIM(name)                               AS category_name,
+    TRY_TO_DECIMAL(TRIM(daily_rate), 12, 2)  AS daily_rate
+FROM AVELTO_RENTALS.BRONZE.BRONZE_CAR_CATEGORIES;

@@ -1,115 +1,171 @@
 
 ```text
-Prompt 7 (verification, optional but recommended)
--------------------------------------------------
-Run row counts on all eight Bronze tables and confirm they match the source
-files exactly (seven CSVs plus 2,000 BookWave reservation records). Then run
-row counts on all seven Gold tables and spot-check that every
-pickup_branch_id and return_branch_id in fact_reservations exists in
-dim_branches, and every currency_code in fact_reservations exists in
-dim_currencies. Also show me the current refresh state of the Silver and
-Gold Dynamic Tables and confirm they're meeting their target lag. Summarize
-the results.
+Prompt 6 (land the Gold star schema, as chained Dynamic Tables)
+---------------------------------------------------------------
+Using the Silver-layer Dynamic Tables (plus the already-clean Bronze
+branches, cars, and customers tables), build the Gold-layer star schema as
+Dynamic Tables, each with a target lag of 3 minutes so they refresh shortly
+after Silver does:
+- fact_reservations: one row per reservation, with amount_local, currency_code,
+  and a total_amount_usd column converted using the currencies exchange rate
+- dim_branches: branches enriched with country, region, and currency_code
+- dim_cars, dim_customers: as-is from Bronze, no cleanup was needed
+- dim_countries, dim_currencies: new reference dimensions
+- bridge_branch_category_availability: one row per branch x category with an
+  is_offered flag
+
+Use dim_branches twice in fact_reservations, once for pickup_branch_id, once
+for return_branch_id, since a rental can start and end at different branches.
 ```
 
 ## Output
 
-Everything checks out: Bronze matches the source files exactly, the Gold tables are consistent, and all 15 dynamic tables are refreshing successfully.
+The Gold star schema is built: all 7 dynamic tables in `AVELTO_RENTALS.GOLD` are `ACTIVE` with a 3-minute target lag, and every check passed.
 
-**Bronze vs source files**
+| Dynamic table | Rows (= distinct keys) | Built from | Refresh mode |
+|---|---|---|---|
+| `FACT_RESERVATIONS` | 2000 | `STG_BOOKWAVE_RESERVATIONS` + `STG_CURRENCIES` | ADAPTIVE |
+| `DIM_BRANCHES` | 10 | `STG_BRANCHES` + `STG_COUNTRIES` | FULL |
+| `DIM_CARS` | 210 | `STG_CARS` | FULL |
+| `DIM_CUSTOMERS` | 500 | `STG_CUSTOMERS` | ADAPTIVE |
+| `DIM_COUNTRIES` | 7 | `STG_COUNTRIES` | FULL |
+| `DIM_CURRENCIES` | 6 | `STG_CURRENCIES` | ADAPTIVE |
+| `BRIDGE_BRANCH_CATEGORY_AVAILABILITY` | 60 | `STG_BRANCH_CATEGORY_AVAILABILITY` | FULL |
 
-| Source file | Rows in file | Bronze table | Bronze rows | Match |
-|---|---|---|---|---|
-| `branch_category_availability.csv` | 60 | `BRONZE_BRANCH_CATEGORY_AVAILABILITY` | 60 | yes |
-| `branches.csv` | 10 | `BRONZE_BRANCHES` | 10 | yes |
-| `car_categories.csv` | 6 | `BRONZE_CAR_CATEGORIES` | 6 | yes |
-| `cars.csv` | 210 | `BRONZE_CARS` | 210 | yes |
-| `countries.csv` | 7 | `BRONZE_COUNTRIES` | 7 | yes |
-| `currencies.csv` | 6 | `BRONZE_CURRENCIES` | 6 | yes |
-| `customers.csv` | 500 | `BRONZE_CUSTOMERS` | 500 | yes |
-| `reservations_export.json` | 2,000 records | `BRONZE_BOOKWAVE_RESERVATIONS_RAW` | 2,000 | yes |
+**Fact table:**
+- Each row has `amount_local`, `currency_code` and `total_amount_usd`, which is `amount_local × usd_exchange_rate` rounded to 2 decimals. It also has `rental_days` and the payment fields.
+- It has both `pickup_branch_id` and `return_branch_id` (the source's `dropoff_branch_id`). Each joins to `DIM_BRANCHES` separately.
+- **Most rentals are one-way:** 1,818 of the 2,000 start and end at different branches.
 
-- The CSV counts leave out each file's header row.
-- The JSON file is a single object, and the reservations sit in its `records` array of 2,000 entries, which matches Bronze. The file also contains `export_date`, `export_type`, `source` and `field_mapping_note`.
+**Checks:**
+- Every foreign key in the fact table finds its dimension row: customer, car, pickup branch, return branch and currency.
+- `total_amount_usd` is never NULL.
+- Every branch has a country, and every bridge row's branch exists.
 
-**Gold row counts and key checks**
-- **Row counts:** `FACT_RESERVATIONS` 2,000; `DIM_BRANCHES` 10; `DIM_CARS` 210; `DIM_CUSTOMERS` 500; `DIM_COUNTRIES` 7; `DIM_CURRENCIES` 6; `BRIDGE_BRANCH_CATEGORY_AVAILABILITY` 60. All 7 match their Bronze sources.
-- **Branches:** 0 `pickup_branch_id` and 0 `return_branch_id` values are missing from `DIM_BRANCHES`. All 10 branches are used both as a pickup and as a return branch.
-- **Currencies:** 0 `currency_code` values are missing from `DIM_CURRENCIES`, and all 6 currencies are used.
+A sample query joining `DIM_BRANCHES` twice works. The top routes by revenue are US → US ($115,950) and US → Germany ($101,270).
 
-**Refresh state and target lag**
-
-| Layer | Tables | State | Last refresh | Target lag | Average lag | Highest lag | Share of time within target |
-|---|---|---|---|---|---|---|---|
-| Silver | 8 | ACTIVE | SUCCEEDED | 60 s | 25 s | 61–86 s | 1.000 |
-| Gold | 7 | ACTIVE | SUCCEEDED | 180 s | 50 s | 105–111 s | 1.000 |
-
-Both layers are meeting their target lag, with one caveat for Silver. Snowflake reports 1.000 as the share of time within target. But the highest lag for every Silver table was briefly above 60 seconds, up to 86 s for `STG_BRANCH_CATEGORY_AVAILABILITY`. So 1.000 means very nearly all the time, not literally always; these were short overshoots. Gold never came close to its 180-second limit.
+**Things to know:**
+- **Source tables:** branches, cars and customers come from the Silver `STG_` tables instead of Bronze. The rows are the same, but the columns have proper types (in Bronze every column is TEXT).
+- **FULL refresh:** four Gold tables refresh in FULL mode because their Silver sources do. At these sizes the cost is negligible.
+- **Personal data:** customer email, phone, driver's licence number and date of birth are still unmasked in `DIM_CUSTOMERS`.
+- **Car categories:** there is no `DIM_CAR_CATEGORIES`. `DIM_CARS` and the bridge carry only `category_id`, and the bridge also has `category_name`.
 
 ## SQL used
 
-### Bronze vs source files
+### Pre-checks
 
 ```sql
--- Find the named file formats (inline FILE_FORMAT options are not allowed when querying a stage)
-SHOW FILE FORMATS IN DATABASE AVELTO_RENTALS;
-
--- Structure of the JSON export: one object with a 2,000-entry "records" array
-SELECT k.key, TYPEOF(k.value) AS value_type, IFF(IS_ARRAY(k.value), ARRAY_SIZE(k.value), NULL) AS array_size
-FROM @AVELTO_RENTALS.BRONZE.BRONZE_LANDING_STAGE/reservations_export.json (FILE_FORMAT => 'AVELTO_RENTALS.BRONZE.JSON_RAW_FMT') s,
-     LATERAL FLATTEN(INPUT => s.$1) k;
-
--- Bronze row counts vs staged files (CSV counts exclude the header row)
-WITH src AS (
-  SELECT LOWER(REGEXP_SUBSTR(METADATA$FILENAME, '[^/]+$')) AS f, COUNT(*) - 1 AS file_rows
-  FROM @AVELTO_RENTALS.BRONZE.BRONZE_LANDING_STAGE (PATTERN => '.*[.]csv')
-  GROUP BY 1
-  UNION ALL
-  SELECT 'reservations_export.json', SUM(ARRAY_SIZE($1:records))
-  FROM @AVELTO_RENTALS.BRONZE.BRONZE_LANDING_STAGE/reservations_export.json (FILE_FORMAT => 'AVELTO_RENTALS.BRONZE.JSON_RAW_FMT')
-),
-bronze AS (
-  SELECT 'branch_category_availability.csv' f, COUNT(*) n FROM AVELTO_RENTALS.BRONZE.BRONZE_BRANCH_CATEGORY_AVAILABILITY
-  UNION ALL SELECT 'branches.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_BRANCHES
-  UNION ALL SELECT 'car_categories.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_CAR_CATEGORIES
-  UNION ALL SELECT 'cars.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_CARS
-  UNION ALL SELECT 'countries.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_COUNTRIES
-  UNION ALL SELECT 'currencies.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_CURRENCIES
-  UNION ALL SELECT 'customers.csv', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_CUSTOMERS
-  UNION ALL SELECT 'reservations_export.json', COUNT(*) FROM AVELTO_RENTALS.BRONZE.BRONZE_BOOKWAVE_RESERVATIONS_RAW
-)
-SELECT b.f AS source_file, s.file_rows, b.n AS bronze_rows, s.file_rows = b.n AS matches
-FROM bronze b LEFT JOIN src s ON s.f = b.f ORDER BY 1;
+SELECT (SELECT LISTAGG(schema_name, ',') FROM AVELTO_RENTALS.INFORMATION_SCHEMA.SCHEMATA) schemas,
+ (SELECT MIN(DATEDIFF(day, rental_start, rental_end)) FROM AVELTO_RENTALS.SILVER.STG_BOOKWAVE_RESERVATIONS) min_days,
+ (SELECT COUNT_IF(DATEDIFF(day, rental_start, rental_end)=0) FROM AVELTO_RENTALS.SILVER.STG_BOOKWAVE_RESERVATIONS) zero_day;
 ```
 
-The JSON count uses `ARRAY_SIZE($1:records)` because the file is one object holding a `records` array. Counting rows directly returns 1. This version was run and returns 2,000.
+The `FACT_RESERVATIONS` SELECT below was also run on its own with `LIMIT 3` as a test.
 
-### Gold row counts and key checks
+### Creating the Gold schema and dynamic tables
 
 ```sql
-SELECT 'FACT_RESERVATIONS' chk, COUNT(*) n FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
-UNION ALL SELECT 'DIM_BRANCHES', COUNT(*) FROM AVELTO_RENTALS.GOLD.DIM_BRANCHES
-UNION ALL SELECT 'DIM_CARS', COUNT(*) FROM AVELTO_RENTALS.GOLD.DIM_CARS
-UNION ALL SELECT 'DIM_CUSTOMERS', COUNT(*) FROM AVELTO_RENTALS.GOLD.DIM_CUSTOMERS
-UNION ALL SELECT 'DIM_COUNTRIES', COUNT(*) FROM AVELTO_RENTALS.GOLD.DIM_COUNTRIES
-UNION ALL SELECT 'DIM_CURRENCIES', COUNT(*) FROM AVELTO_RENTALS.GOLD.DIM_CURRENCIES
-UNION ALL SELECT 'BRIDGE_BRANCH_CATEGORY_AVAILABILITY', COUNT(*) FROM AVELTO_RENTALS.GOLD.BRIDGE_BRANCH_CATEGORY_AVAILABILITY
-UNION ALL SELECT 'orphan pickup_branch_id', COUNT(*) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES d ON d.branch_id = f.pickup_branch_id WHERE d.branch_id IS NULL
-UNION ALL SELECT 'orphan return_branch_id', COUNT(*) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES d ON d.branch_id = f.return_branch_id WHERE d.branch_id IS NULL
-UNION ALL SELECT 'orphan currency_code', COUNT(*) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_CURRENCIES d ON d.currency_code = f.currency_code WHERE d.currency_code IS NULL
-UNION ALL SELECT 'distinct pickup branches used', COUNT(DISTINCT pickup_branch_id) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
-UNION ALL SELECT 'distinct return branches used', COUNT(DISTINCT return_branch_id) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
-UNION ALL SELECT 'distinct currencies used', COUNT(DISTINCT currency_code) FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS;
+CREATE SCHEMA IF NOT EXISTS AVELTO_RENTALS.GOLD;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.DIM_CURRENCIES
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT currency_code, currency_name, symbol, usd_exchange_rate, decimals
+FROM AVELTO_RENTALS.SILVER.STG_CURRENCIES;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.DIM_COUNTRIES
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT country_id, country_code, country_name, region, currency_code
+FROM AVELTO_RENTALS.SILVER.STG_COUNTRIES;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.DIM_BRANCHES
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT b.branch_id, b.branch_name, b.city, b.capacity, b.country_id,
+       c.country_name, c.region, c.currency_code
+FROM AVELTO_RENTALS.SILVER.STG_BRANCHES b
+LEFT JOIN AVELTO_RENTALS.SILVER.STG_COUNTRIES c ON c.country_id = b.country_id;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.DIM_CARS
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT car_id, license_plate, model, model_year, category_id, current_branch_id
+FROM AVELTO_RENTALS.SILVER.STG_CARS;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.DIM_CUSTOMERS
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT customer_id, customer_name, email, phone, driver_license_number, date_of_birth
+FROM AVELTO_RENTALS.SILVER.STG_CUSTOMERS;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.BRIDGE_BRANCH_CATEGORY_AVAILABILITY
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT branch_id, category_id, category_name, is_offered
+FROM AVELTO_RENTALS.SILVER.STG_BRANCH_CATEGORY_AVAILABILITY;
+
+CREATE OR REPLACE DYNAMIC TABLE AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
+  TARGET_LAG = '3 minutes' WAREHOUSE = COMPUTE_WH REFRESH_MODE = AUTO
+AS
+SELECT
+    r.reservation_id,
+    r.customer_id,
+    r.vehicle_id                                   AS car_id,
+    r.pickup_branch_id,
+    r.dropoff_branch_id                            AS return_branch_id,
+    r.booked_on,
+    r.rental_start,
+    r.rental_end,
+    DATEDIFF(day, r.rental_start, r.rental_end)    AS rental_days,
+    r.payment_id,
+    r.payment_method,
+    r.payment_date,
+    r.amount_paid                                  AS amount_local,
+    r.currency                                     AS currency_code,
+    ROUND(r.amount_paid * c.usd_exchange_rate, 2)  AS total_amount_usd
+FROM AVELTO_RENTALS.SILVER.STG_BOOKWAVE_RESERVATIONS r
+LEFT JOIN AVELTO_RENTALS.SILVER.STG_CURRENCIES c ON c.currency_code = r.currency;
 ```
 
-### Refresh state and target lag
+These statements were run together in one `EXECUTE IMMEDIATE $$ BEGIN ... END; $$` block.
+
+### Checking the result
 
 ```sql
-SELECT schema_name, name, scheduling_state:state::STRING AS state, target_lag_sec,
-       time_within_target_lag_ratio, maximum_lag_sec, mean_lag_sec,
-       latest_data_timestamp, last_completed_refresh_state
-FROM TABLE(AVELTO_RENTALS.INFORMATION_SCHEMA.DYNAMIC_TABLES())
-WHERE schema_name IN ('SILVER','GOLD') ORDER BY 1 DESC, 2;
+SHOW DYNAMIC TABLES IN SCHEMA AVELTO_RENTALS.GOLD;
+
+SELECT 'FACT_RESERVATIONS' t, COUNT(*) n, COUNT(DISTINCT reservation_id) k FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
+UNION ALL SELECT 'DIM_BRANCHES', COUNT(*), COUNT(DISTINCT branch_id) FROM AVELTO_RENTALS.GOLD.DIM_BRANCHES
+UNION ALL SELECT 'DIM_CARS', COUNT(*), COUNT(DISTINCT car_id) FROM AVELTO_RENTALS.GOLD.DIM_CARS
+UNION ALL SELECT 'DIM_CUSTOMERS', COUNT(*), COUNT(DISTINCT customer_id) FROM AVELTO_RENTALS.GOLD.DIM_CUSTOMERS
+UNION ALL SELECT 'DIM_COUNTRIES', COUNT(*), COUNT(DISTINCT country_id) FROM AVELTO_RENTALS.GOLD.DIM_COUNTRIES
+UNION ALL SELECT 'DIM_CURRENCIES', COUNT(*), COUNT(DISTINCT currency_code) FROM AVELTO_RENTALS.GOLD.DIM_CURRENCIES
+UNION ALL SELECT 'BRIDGE_BRANCH_CATEGORY_AVAILABILITY', COUNT(*), COUNT(DISTINCT branch_id, category_id) FROM AVELTO_RENTALS.GOLD.BRIDGE_BRANCH_CATEGORY_AVAILABILITY
+UNION ALL SELECT 'orphan: fact.customer_id', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_CUSTOMERS d ON d.customer_id=f.customer_id WHERE d.customer_id IS NULL
+UNION ALL SELECT 'orphan: fact.car_id', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_CARS d ON d.car_id=f.car_id WHERE d.car_id IS NULL
+UNION ALL SELECT 'orphan: fact.pickup_branch_id', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES d ON d.branch_id=f.pickup_branch_id WHERE d.branch_id IS NULL
+UNION ALL SELECT 'orphan: fact.return_branch_id', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES d ON d.branch_id=f.return_branch_id WHERE d.branch_id IS NULL
+UNION ALL SELECT 'orphan: fact.currency_code', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f LEFT JOIN AVELTO_RENTALS.GOLD.DIM_CURRENCIES d ON d.currency_code=f.currency_code WHERE d.currency_code IS NULL
+UNION ALL SELECT 'null total_amount_usd', COUNT_IF(total_amount_usd IS NULL), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS
+UNION ALL SELECT 'orphan: branch.country_id', COUNT_IF(country_name IS NULL), NULL FROM AVELTO_RENTALS.GOLD.DIM_BRANCHES
+UNION ALL SELECT 'orphan: bridge.branch_id', COUNT(*), NULL FROM AVELTO_RENTALS.GOLD.BRIDGE_BRANCH_CATEGORY_AVAILABILITY x LEFT JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES d ON d.branch_id=x.branch_id WHERE d.branch_id IS NULL
+UNION ALL SELECT 'reservations pickup <> return branch', COUNT_IF(pickup_branch_id<>return_branch_id), NULL FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS;
 ```
+
+### Sample star query (DIM_BRANCHES joined twice)
+
+```sql
+SELECT pb.country_name AS pickup_country, rb.country_name AS return_country,
+       COUNT(*) AS reservations, SUM(f.total_amount_usd) AS revenue_usd
+FROM AVELTO_RENTALS.GOLD.FACT_RESERVATIONS f
+JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES pb ON pb.branch_id = f.pickup_branch_id
+JOIN AVELTO_RENTALS.GOLD.DIM_BRANCHES rb ON rb.branch_id = f.return_branch_id
+GROUP BY 1, 2 ORDER BY revenue_usd DESC LIMIT 5;
+```
+
+
+
+
 
 

@@ -1,1 +1,5 @@
 LIST @AVELTO_RENTALS.BRONZE.BRONZE_LANDING_STAGE;
+
+select * from @AVELTO_RENTALS.BRONZE.BRONZE_LANDING_STAGE;
+
+select * from AVELTO_RENTALS.BRONZE."bronze_bookwave_reservations_raw" limit 10;
